@@ -558,18 +558,108 @@ function workerTone(liveStatus: string | null): string {
   }
 }
 
+/** The live worker thread on a card, else its newest one. */
+function primaryThread(card: BoardCard): string | null {
+  const live = card.workers.find(
+    (worker) => worker.liveStatus === "working" || worker.liveStatus === "starting",
+  );
+  return (live ?? card.workers[0])?.threadId ?? null;
+}
+
+/** One-line reply box for a question on the board. */
+function InlineReply({
+  item,
+  rpc,
+  onDone,
+}: {
+  item: NonNullable<BoardCard["question"]>;
+  rpc: Rpc;
+  onDone: () => void;
+}) {
+  const [text, setText] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const send = async (value: string) => {
+    const answer = value.trim();
+    if (busy || answer === "") return;
+    setBusy(true);
+    try {
+      const result = await rpc.call("answer", { id: item.id, answer });
+      if (result.ok) toast.success("Sent");
+      else toast.message("Already handled elsewhere. Refreshing.");
+      setText("");
+      onDone();
+    } catch (error) {
+      toast.error(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="space-y-1.5">
+      {item.options.length > 0 ? (
+        <div className="flex flex-wrap gap-1.5">
+          {item.options.map((option) => (
+            <Button
+              key={option}
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => void send(option)}
+            >
+              {option}
+            </Button>
+          ))}
+        </div>
+      ) : null}
+      <form
+        className="flex gap-1.5"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void send(text);
+        }}
+      >
+        <Input
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          placeholder={item.placeholder ?? "Reply"}
+          className="h-8 min-w-0 flex-1 text-xs"
+        />
+        <Button size="sm" type="submit" disabled={busy || text.trim() === ""}>
+          Send
+        </Button>
+      </form>
+    </div>
+  );
+}
+
 function BoardCardTile({
   card,
+  rpc,
   onRead,
   onArchive,
   onDragStart,
+  onMove,
+  onOpenThread,
+  onChanged,
 }: {
   card: BoardCard;
+  rpc: Rpc;
   onRead: (card: BoardCard) => void;
   onArchive: (card: BoardCard) => void;
   onDragStart: (card: BoardCard) => void;
+  onMove: (card: BoardCard, lane: BoardLane) => Promise<void>;
+  onOpenThread: (threadId: string) => void;
+  onChanged: () => void;
 }) {
   const question = card.question;
+  const [moving, setMoving] = React.useState(false);
+  const move = (lane: BoardLane) => {
+    if (moving) return;
+    setMoving(true);
+    void onMove(card, lane).finally(() => setMoving(false));
+  };
+  const thread = primaryThread(card);
+  const openPr = card.pullRequests.find((pullRequest) => pullRequest.state === "open");
   return (
     <article
       draggable={card.movable}
@@ -627,30 +717,60 @@ function BoardCardTile({
         </button>
       </div>
 
-      {question === null && card.stalled ? (
-        <div className="space-y-1.5 border-t border-border/60 pt-1.5">
-          <p className="text-xs text-muted-foreground">
-            Went quiet while in progress. Nobody has said why.
-          </p>
-          <Button
-            size="sm"
-            variant="outline"
-            className="max-w-full"
-            onClick={() => onRead(card)}
-          >
-            Look at it
-          </Button>
-        </div>
-      ) : null}
-
       {question !== null ? (
         <div className="space-y-1.5 border-t border-border/60 pt-1.5">
           <p className="line-clamp-4 text-xs text-muted-foreground">
             {question.question}
           </p>
-          <Button size="sm" variant="outline" className="max-w-full" onClick={() => onRead(card)}>
-            Open
+          {question.threadId !== null ? (
+            <InlineReply item={question} rpc={rpc} onDone={onChanged} />
+          ) : (
+            <Button size="sm" variant="outline" onClick={() => onRead(card)}>
+              Open
+            </Button>
+          )}
+        </div>
+      ) : card.lane === "queue" && card.movable ? (
+        <div className="border-t border-border/60 pt-1.5">
+          <Button size="sm" disabled={moving} onClick={() => move("in_progress")}>
+            {moving ? "Starting…" : "Start"}
           </Button>
+        </div>
+      ) : card.lane === "in_review" ? (
+        <div className="flex flex-wrap gap-1.5 border-t border-border/60 pt-1.5">
+          {openPr !== undefined ? (
+            <Button size="sm" variant="outline" asChild>
+              <a href={openPr.url} target="_blank" rel="noreferrer">
+                PR #{openPr.number}
+              </a>
+            </Button>
+          ) : thread !== null ? (
+            <Button size="sm" variant="outline" onClick={() => onOpenThread(thread)}>
+              Open thread
+            </Button>
+          ) : null}
+          {card.movable ? (
+            <Button size="sm" disabled={moving} onClick={() => move("done")}>
+              Sign off
+            </Button>
+          ) : null}
+        </div>
+      ) : card.lane === "in_progress" ? (
+        <div className="space-y-1 border-t border-border/60 pt-1.5">
+          {card.stalled ? (
+            <p className="text-xs text-muted-foreground">
+              No activity for a while.
+            </p>
+          ) : null}
+          {thread !== null ? (
+            <Button size="sm" variant="outline" onClick={() => onOpenThread(thread)}>
+              Open thread
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" onClick={() => onRead(card)}>
+              Look at it
+            </Button>
+          )}
         </div>
       ) : null}
     </article>
@@ -666,6 +786,9 @@ function BoardColumn({
   onArchive,
   onDragStart,
   onDrop,
+  onMove,
+  onOpenThread,
+  onChanged,
 }: {
   lane: BoardLane;
   cards: BoardCard[];
@@ -675,6 +798,9 @@ function BoardColumn({
   onArchive: (card: BoardCard) => void;
   onDragStart: (card: BoardCard) => void;
   onDrop: (lane: BoardLane, cardId: string) => void;
+  onMove: (card: BoardCard, lane: BoardLane) => Promise<void>;
+  onOpenThread: (threadId: string) => void;
+  onChanged: () => void;
 }) {
   const [isOver, setOver] = React.useState(false);
   const droppable = DROPPABLE_LANES.includes(lane);
@@ -733,9 +859,13 @@ function BoardColumn({
           <BoardCardTile
             key={card.id}
             card={card}
+            rpc={rpc}
             onRead={onRead}
             onArchive={onArchive}
             onDragStart={onDragStart}
+            onMove={onMove}
+            onOpenThread={onOpenThread}
+            onChanged={onChanged}
           />
         ))
       )}
@@ -870,7 +1000,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
           toast.error(result.error ?? "That move was refused.");
           return;
         }
-        if (result.dispatchedTo !== null) toast.success("Dispatched");
+        if (result.dispatchedTo !== null) toast.success("Started");
         else if (result.error !== null) toast.warning(result.error);
         await refresh();
       } catch (error) {
@@ -984,6 +1114,9 @@ function CommandCenter({ subPath }: { subPath: string }) {
                 onArchive={(card) => void archive(card.id)}
                 onDragStart={() => undefined}
                 onDrop={handleDrop}
+                onMove={applyMove}
+                onOpenThread={openThread}
+                onChanged={() => void refresh()}
               />
             ))}
           </div>

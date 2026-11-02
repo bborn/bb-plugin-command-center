@@ -331,7 +331,8 @@ export function CardViewer({
       toast.error(result.error ?? "That move was refused.");
       return;
     }
-    if (result.dispatchedTo !== null) toast.success("Dispatched");
+    if (result.dispatchedTo !== null) toast.success("Started");
+    else if (result.error !== null) toast.warning(result.error);
     await load();
   };
 
@@ -579,20 +580,37 @@ export function CardViewer({
         ) : null}
 
         <div className="flex flex-wrap gap-2 border-t border-border pt-5">
-          {card.movable
-            ? (["queue", "in_progress", "in_review", "done"] as BoardLane[])
-                .filter((lane) => lane !== card.lane)
-                .map((lane) => (
-                  <Button
-                    key={lane}
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void move(lane)}
-                  >
-                    → {LANE_LABEL[lane]}
-                  </Button>
-                ))
-            : null}
+          {card.movable && card.lane === "queue" ? (
+            <Button size="sm" onClick={() => void move("in_progress")}>
+              Start
+            </Button>
+          ) : null}
+          {card.movable && card.lane === "in_review" ? (
+            <Button size="sm" onClick={() => void move("done")}>
+              Sign off
+            </Button>
+          ) : null}
+          {card.movable ? (
+            <details className="text-xs">
+              <summary className="cursor-pointer px-2 py-1.5 text-muted-foreground">
+                Move…
+              </summary>
+              <div className="mt-1 flex flex-wrap gap-1.5">
+                {(["queue", "in_progress", "in_review", "done"] as BoardLane[])
+                  .filter((lane) => lane !== card.lane)
+                  .map((lane) => (
+                    <Button
+                      key={lane}
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => void move(lane)}
+                    >
+                      → {LANE_LABEL[lane]}
+                    </Button>
+                  ))}
+              </div>
+            </details>
+          ) : null}
           <Button
             size="sm"
             variant="ghost"

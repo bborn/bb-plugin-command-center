@@ -191,6 +191,29 @@ export function QuestionCard({
   onResolved?: () => void;
 }) {
   const [busy, setBusy] = React.useState(false);
+  const [reply, setReply] = React.useState("");
+  // Only questions with someone to deliver to can take an answer here.
+  const canAnswer = item.threadId !== null;
+
+  const send = async (text: string) => {
+    const answer = text.trim();
+    if (busy || answer === "") return;
+    setBusy(true);
+    try {
+      const result = await rpc.call("answer", { id: item.id, answer });
+      if (result.ok) {
+        toast.success("Sent");
+        setReply("");
+      } else {
+        toast.message("Already handled elsewhere. Refreshing.");
+      }
+      onResolved?.();
+    } catch (error) {
+      toast.error(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const dismiss = async () => {
     if (busy) return;
@@ -241,8 +264,48 @@ export function QuestionCard({
 
       <p className="text-sm text-foreground">{item.question}</p>
 
-      {/* No answer to give here — reply in the thread itself, then dismiss
-          this notification once it's handled. */}
+      {canAnswer && item.options.length > 0 ? (
+        <div className="flex flex-wrap gap-2">
+          {item.options.map((option) => (
+            <Button
+              key={option}
+              size="sm"
+              disabled={busy}
+              onClick={() => void send(option)}
+            >
+              {option}
+            </Button>
+          ))}
+        </div>
+      ) : null}
+
+      {canAnswer ? (
+        <form
+          className="flex items-end gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void send(reply);
+          }}
+        >
+          <textarea
+            value={reply}
+            onChange={(event) => setReply(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                void send(reply);
+              }
+            }}
+            rows={2}
+            placeholder={item.placeholder ?? "Reply. It goes straight to the agent."}
+            className="min-h-[2.5rem] flex-1 resize-y rounded-md border border-border bg-background px-2 py-1.5 text-sm"
+          />
+          <Button size="sm" type="submit" disabled={busy || reply.trim() === ""}>
+            Send
+          </Button>
+        </form>
+      ) : null}
+
       <div className="flex flex-wrap gap-2">
         {item.reviewThreadId !== null ? (
           <Button
@@ -274,7 +337,7 @@ export function QuestionCard({
         <Button size="sm" variant="ghost" onClick={() => void snooze(4)}>
           4h
         </Button>
-        <Button size="sm" disabled={busy} onClick={() => void dismiss()}>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void dismiss()}>
           Dismiss
         </Button>
       </div>

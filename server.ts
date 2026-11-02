@@ -171,7 +171,7 @@ const boardCardDto = z.object({
   question: itemDto.nullable(),
   /**
    * True when work claimed to be in progress has gone quiet for longer than the
-   * stall threshold. Such a card is moved into Needs you: nobody is working it
+   * stall threshold. It keeps its lane and gets a "stalled" flag; nobody is working it
    * and nobody has said why, which needs the Captain, not patience.
    */
   stalled: z.boolean(),
@@ -3369,10 +3369,8 @@ export default async function plugin(bb: BbPluginApi) {
         stallMs,
       };
       card.lastActivityAt = lastActivity(input);
-      if (isStalled(input)) {
-        card.stalled = true;
-        card.lane = "needs_you";
-      }
+      // Flag it, but leave it in its lane: "Needs you" is for questions.
+      if (isStalled(input)) card.stalled = true;
     }
 
     cards.sort(
@@ -3574,6 +3572,243 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  /** The BB project a Tasks tracker project is linked to, if any. */
+  async function linkedBbProjectFor(trackerProjectId: string): Promise<string | null> {
+    try {
+      const result = await tasksCall(
+        "listProjects",
+        {},
+        z.object({
+          projects: z.array(
+            z.looseObject({ id: z.string(), linkedBbProjectId: z.string().nullish() }),
+          ),
+        }),
+      );
+      return (
+        result.projects.find((project) => project.id === trackerProjectId)
+          ?.linkedBbProjectId ?? null
+      );
+    } catch (error) {
+      bb.log.warn(`listProjects failed: ${String(error)}`);
+      return null;
+    }
+  }
+
+  /** Spawn a fresh worker for a task card (wake, or first start). */
+  async function wakeTaskCard(
+    cardId: string,
+  ): Promise<{ ok: boolean; threadId: string | null; error: string | null }> {
+    const request = requestRow(cardId);
+    let task: TaskRow | null;
+    if (request !== undefined) {
+      if (request.task_key === null) {
+        return { ok: false, threadId: null, error: "This card has no task yet." };
+      }
+      task = await resolveTaskByKey(request.task_key);
+    } else {
+      try {
+        const result = await tasksCall(
+          "getTask",
+          { taskId: cardId },
+          z.object({ task: taskRowSchema.nullable() }),
+        );
+        task = result.task;
+      } catch (error) {
+        return { ok: false, threadId: null, error: String(error) };
+      }
+    }
+    if (task === null) {
+      return { ok: false, threadId: null, error: "Could not resolve this card's task." };
+    }
+
+    // task.projectId is the Tasks plugin's OWN internal project id (a ULID,
+    // its "AMM"-style space) — never a BB project id, even though the field
+    // is confusingly named the same. The request this card came from
+    // carries the real BB project id it was dispatched into; a card
+    // adopted straight from a task has no such request, so fall back to
+    // whichever BB project an existing worker thread already lives in.
+    let projectId = request?.project_id ?? null;
+    if (projectId === null) {
+      const workers = await taskWorkers(task.id);
+      for (const worker of workers) {
+        try {
+          const thread = await bb.sdk.threads.get({ threadId: worker.threadId });
+          projectId = thread.projectId;
+          break;
+        } catch {
+          // Try the next worker thread.
+        }
+      }
+    }
+    if (projectId === null && task.projectId) {
+      // A task nobody has worked yet: its tracker project may be linked to a
+      // BB project.
+      projectId = await linkedBbProjectFor(task.projectId);
+    }
+    if (projectId === null) {
+      return {
+        ok: false,
+        threadId: null,
+        error: "Could not resolve this task's BB project. Link its tracker project to a BB project first.",
+      };
+    }
+
+    const oldWorkers = await taskWorkers(task.id);
+
+    let recentComments: string[] = [];
+    // Comments a Captain added that never reached a live thread (the exact
+    // "wake up" scenario) — notifiedCount stays 0 forever once written,
+    // since Tasks only sets it at delivery time. Forward these to the new
+    // thread directly instead of leaving them to wait for the next comment
+    // Tasks' own delivery would still misroute to the now-archived thread,
+    // since it targets whoever last commented as an agent — which stays the
+    // old thread until the new one comments on the task itself.
+    let stuck: string[] = [];
+    try {
+      const result = await tasksCall(
+        "listComments",
+        { taskId: task.id },
+        z.object({
+          comments: z.array(
+            z.looseObject({
+              body: z.string(),
+              authorName: z.string().nullish(),
+              kind: z.string().nullish(),
+              notifiedCount: z.number().nullish(),
+            }),
+          ),
+        }),
+      );
+      recentComments = result.comments
+        .slice(-12)
+        .map((comment) => `${comment.authorName ?? comment.kind ?? "?"}: ${comment.body}`);
+      stuck = result.comments
+        .filter((comment) => comment.kind === "user" && (comment.notifiedCount ?? 0) === 0)
+        .map((comment) => `${comment.authorName ?? "You"}: ${comment.body}`);
+    } catch {
+      // Best effort — a fresh architect still works from the task's own
+      // description without this, just with less history.
+    }
+
+    const mission = [
+      task.description ?? "",
+      "",
+      ...(oldWorkers.length === 0
+        ? [
+            "## Starting",
+            "Nobody has worked this task yet. The Captain pressed Start on it, so begin now.",
+          ]
+        : [
+            "## Why you are fresh",
+            "The previous worker thread on this task went idle and its worktree was already cleaned up by BB, so nothing could wake it to read new comments. You are a clean continuation of the same task — read the history below before doing anything.",
+          ]),
+      "",
+      "As your very first action, run `bb tasks comment " +
+        task.key +
+        ' --body "Picking this up."` (or a real status update if you already have one) — until you post a task comment yourself, any new comment the Captain adds will still be misrouted to the thread that just went idle.',
+      "",
+      "## Task history",
+      ...(recentComments.length > 0 ? recentComments : ["(no prior comments)"]),
+    ].join("\n");
+
+    // Same routing rule as dispatch: only a project already under a
+    // project chief goes through Chief's hierarchy. Everything else wakes
+    // the task with a lean, single worker thread.
+    let newThreadId: string;
+    if (await projectHasLiveChief(projectId)) {
+      try {
+        const result = await handoff(
+          {
+            taskKey: task.key,
+            title: task.title,
+            mission,
+            projectId,
+          },
+          null,
+        );
+        newThreadId = result.threadId;
+      } catch (error) {
+        return { ok: false, threadId: null, error: String(error) };
+      }
+    } else {
+      try {
+        const preferred = await dispatchPreferenceFor(task.key);
+        const direct = await spawnWorkerDirect({
+          projectId,
+          title: task.title,
+          prompt: directWakeBrief(task, mission),
+          providerId: preferred.providerId,
+          model: preferred.model,
+        });
+        newThreadId = direct.threadId;
+      } catch (error) {
+        bb.log.warn(`wakeTask failed for ${task.key}: ${String(error)}`);
+        return { ok: false, threadId: null, error: String(error) };
+      }
+    }
+
+    try {
+      await tasksCall(
+        "taskThreadsAttach",
+        { taskId: task.id, threadId: newThreadId },
+        z.object({ threadId: z.string() }),
+      );
+    } catch (error) {
+      // The new thread exists and owns the task either way; only the
+      // board's own thread list would be missing it until reattached.
+      bb.log.warn(
+        `handed off ${task.key} to ${newThreadId} but could not attach it: ${String(error)}`,
+      );
+    }
+
+    if (stuck.length > 0) {
+      try {
+        await bb.sdk.threads.send({
+          threadId: newThreadId,
+          mode: "auto",
+          input: [
+            {
+              type: "text",
+              text: [
+                `${stuck.length} comment${stuck.length === 1 ? "" : "s"} on ${task.key} never reached a live thread before you existed:`,
+                "",
+                ...stuck,
+              ].join("\n"),
+              mentions: [],
+            },
+          ],
+        });
+      } catch (error) {
+        bb.log.warn(
+          `handed off ${task.key} to ${newThreadId} but could not forward ${stuck.length} stuck comment(s): ${String(error)}`,
+        );
+      }
+    }
+
+    // The old thread(s) are done being useful — archive them so the card
+    // stops showing a dead worker next to the live one, and so BB can
+    // reclaim their worktrees. Never touch the new thread just created.
+    const oldThreadIds = oldWorkers
+      .map((worker) => worker.threadId)
+      .filter((threadId) => threadId !== newThreadId);
+    if (oldThreadIds.length > 0) {
+      const protectedIds = await protectedOrgThreadIds();
+      const archived = await Promise.all(
+        oldThreadIds
+          .filter((threadId) => !protectedIds.has(threadId))
+          .map(archiveWorkerThread),
+      );
+      for (const result of archived) {
+        if (result.error !== null) {
+          bb.log.warn(`could not archive old worker ${result.threadId}: ${result.error}`);
+        }
+      }
+    }
+
+    publish();
+    return { ok: true, threadId: newThreadId, error: null };
+  }
+
   async function moveCard(
     cardId: string,
     lane: BoardLane,
@@ -3637,9 +3872,18 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     // An adopted task card: the task board is the only state it has.
+    let dispatchedTo: string | null = null;
+    if (lane === "in_progress") {
+      const workers = await taskWorkers(cardId);
+      if (!workers.some((worker) => worker.liveStatus === "working" || worker.liveStatus === "starting")) {
+        const woke = await wakeTaskCard(cardId);
+        if (!woke.ok) return { ok: false, error: woke.error, dispatchedTo: null };
+        dispatchedTo = woke.threadId;
+      }
+    }
     const error = await writeTaskLane(cardId, lane);
     publish();
-    return { ok: error === null, error, dispatchedTo: null };
+    return { ok: error === null, error, dispatchedTo };
   }
 
   /** Flush comments written before the task existed, notifying the worker. */
@@ -4025,203 +4269,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     },
     async wakeTask({ cardId }) {
-      const request = requestRow(cardId);
-      let task: TaskRow | null;
-      if (request !== undefined) {
-        if (request.task_key === null) {
-          return { ok: false, threadId: null, error: "This card has no task yet." };
-        }
-        task = await resolveTaskByKey(request.task_key);
-      } else {
-        try {
-          const result = await tasksCall(
-            "getTask",
-            { taskId: cardId },
-            z.object({ task: taskRowSchema.nullable() }),
-          );
-          task = result.task;
-        } catch (error) {
-          return { ok: false, threadId: null, error: String(error) };
-        }
-      }
-      if (task === null) {
-        return { ok: false, threadId: null, error: "Could not resolve this card's task." };
-      }
-
-      // task.projectId is the Tasks plugin's OWN internal project id (a ULID,
-      // its "AMM"-style space) — never a BB project id, even though the field
-      // is confusingly named the same. The request this card came from
-      // carries the real BB project id it was dispatched into; a card
-      // adopted straight from a task has no such request, so fall back to
-      // whichever BB project an existing worker thread already lives in.
-      let projectId = request?.project_id ?? null;
-      if (projectId === null) {
-        const workers = await taskWorkers(task.id);
-        for (const worker of workers) {
-          try {
-            const thread = await bb.sdk.threads.get({ threadId: worker.threadId });
-            projectId = thread.projectId;
-            break;
-          } catch {
-            // Try the next worker thread.
-          }
-        }
-      }
-      if (projectId === null) {
-        return {
-          ok: false,
-          threadId: null,
-          error: "Could not resolve this task's BB project — no request or worker thread to read it from.",
-        };
-      }
-
-      const oldWorkers = await taskWorkers(task.id);
-
-      let recentComments: string[] = [];
-      // Comments a Captain added that never reached a live thread (the exact
-      // "wake up" scenario) — notifiedCount stays 0 forever once written,
-      // since Tasks only sets it at delivery time. Forward these to the new
-      // thread directly instead of leaving them to wait for the next comment
-      // Tasks' own delivery would still misroute to the now-archived thread,
-      // since it targets whoever last commented as an agent — which stays the
-      // old thread until the new one comments on the task itself.
-      let stuck: string[] = [];
-      try {
-        const result = await tasksCall(
-          "listComments",
-          { taskId: task.id },
-          z.object({
-            comments: z.array(
-              z.looseObject({
-                body: z.string(),
-                authorName: z.string().nullish(),
-                kind: z.string().nullish(),
-                notifiedCount: z.number().nullish(),
-              }),
-            ),
-          }),
-        );
-        recentComments = result.comments
-          .slice(-12)
-          .map((comment) => `${comment.authorName ?? comment.kind ?? "?"}: ${comment.body}`);
-        stuck = result.comments
-          .filter((comment) => comment.kind === "user" && (comment.notifiedCount ?? 0) === 0)
-          .map((comment) => `${comment.authorName ?? "You"}: ${comment.body}`);
-      } catch {
-        // Best effort — a fresh architect still works from the task's own
-        // description without this, just with less history.
-      }
-
-      const mission = [
-        task.description ?? "",
-        "",
-        "## Why you are fresh",
-        "The previous worker thread on this task went idle and its worktree was already cleaned up by BB, so nothing could wake it to read new comments. You are a clean continuation of the same task — read the history below before doing anything.",
-        "",
-        "As your very first action, run `bb tasks comment " +
-          task.key +
-          ' --body "Picking this up."` (or a real status update if you already have one) — until you post a task comment yourself, any new comment the Captain adds will still be misrouted to the thread that just went idle.',
-        "",
-        "## Task history",
-        ...(recentComments.length > 0 ? recentComments : ["(no prior comments)"]),
-      ].join("\n");
-
-      // Same routing rule as dispatch: only a project already under a
-      // project chief goes through Chief's hierarchy. Everything else wakes
-      // the task with a lean, single worker thread.
-      let newThreadId: string;
-      if (await projectHasLiveChief(projectId)) {
-        try {
-          const result = await handoff(
-            {
-              taskKey: task.key,
-              title: task.title,
-              mission,
-              projectId,
-            },
-            null,
-          );
-          newThreadId = result.threadId;
-        } catch (error) {
-          return { ok: false, threadId: null, error: String(error) };
-        }
-      } else {
-        try {
-          const preferred = await dispatchPreferenceFor(task.key);
-          const direct = await spawnWorkerDirect({
-            projectId,
-            title: task.title,
-            prompt: directWakeBrief(task, mission),
-            providerId: preferred.providerId,
-            model: preferred.model,
-          });
-          newThreadId = direct.threadId;
-        } catch (error) {
-          bb.log.warn(`wakeTask failed for ${task.key}: ${String(error)}`);
-          return { ok: false, threadId: null, error: String(error) };
-        }
-      }
-
-      try {
-        await tasksCall(
-          "taskThreadsAttach",
-          { taskId: task.id, threadId: newThreadId },
-          z.object({ threadId: z.string() }),
-        );
-      } catch (error) {
-        // The new thread exists and owns the task either way; only the
-        // board's own thread list would be missing it until reattached.
-        bb.log.warn(
-          `handed off ${task.key} to ${newThreadId} but could not attach it: ${String(error)}`,
-        );
-      }
-
-      if (stuck.length > 0) {
-        try {
-          await bb.sdk.threads.send({
-            threadId: newThreadId,
-            mode: "auto",
-            input: [
-              {
-                type: "text",
-                text: [
-                  `${stuck.length} comment${stuck.length === 1 ? "" : "s"} on ${task.key} never reached a live thread before you existed:`,
-                  "",
-                  ...stuck,
-                ].join("\n"),
-                mentions: [],
-              },
-            ],
-          });
-        } catch (error) {
-          bb.log.warn(
-            `handed off ${task.key} to ${newThreadId} but could not forward ${stuck.length} stuck comment(s): ${String(error)}`,
-          );
-        }
-      }
-
-      // The old thread(s) are done being useful — archive them so the card
-      // stops showing a dead worker next to the live one, and so BB can
-      // reclaim their worktrees. Never touch the new thread just created.
-      const oldThreadIds = oldWorkers
-        .map((worker) => worker.threadId)
-        .filter((threadId) => threadId !== newThreadId);
-      if (oldThreadIds.length > 0) {
-        const protectedIds = await protectedOrgThreadIds();
-        const archived = await Promise.all(
-          oldThreadIds
-            .filter((threadId) => !protectedIds.has(threadId))
-            .map(archiveWorkerThread),
-        );
-        for (const result of archived) {
-          if (result.error !== null) {
-            bb.log.warn(`could not archive old worker ${result.threadId}: ${result.error}`);
-          }
-        }
-      }
-
-      publish();
-      return { ok: true, threadId: newThreadId, error: null };
+      return await wakeTaskCard(cardId);
     },
     async harnesses() {
       const [{ harnesses, error }, chosen] = await Promise.all([
