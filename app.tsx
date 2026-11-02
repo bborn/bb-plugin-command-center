@@ -536,6 +536,40 @@ const LANES_ORDER: BoardLane[] = [
   "done",
 ];
 
+/** What the filter bar can show. "active" is the default: work in flight and what needs you. */
+type BoardView = "active" | BoardLane;
+const ACTIVE_LANES: BoardLane[] = ["needs_you", "in_progress", "in_review"];
+const VIEW_ORDER: BoardView[] = [
+  "active",
+  "needs_you",
+  "in_progress",
+  "in_review",
+  "queue",
+  "done",
+];
+
+function readStored(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function writeStored(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Private mode or blocked storage; the choice just won't persist.
+  }
+}
+
+/** A card's project label: the BB project name, else its task key prefix. */
+function projectLabel(card: BoardCard): string | null {
+  if (card.projectName !== null) return card.projectName;
+  if (card.taskKey !== null) return card.taskKey.split("-")[0] ?? null;
+  return null;
+}
+
 /** Needs you is derived from open questions, so nothing can be dropped there. */
 const DROPPABLE_LANES: BoardLane[] = [
   "queue",
@@ -953,6 +987,22 @@ function CommandCenter({ subPath }: { subPath: string }) {
     null,
   );
   const [installingTasks, setInstallingTasks] = React.useState(false);
+  const [composerOpen, setComposerOpen] = React.useState(false);
+  const [view, setViewState] = React.useState<BoardView>(() => {
+    const stored = readStored("cc.boardView");
+    return VIEW_ORDER.includes(stored as BoardView) ? (stored as BoardView) : "active";
+  });
+  const setView = (next: BoardView) => {
+    setViewState(next);
+    writeStored("cc.boardView", next);
+  };
+  const [projectFilter, setProjectFilterState] = React.useState<string>(
+    () => readStored("cc.projectFilter") ?? "all",
+  );
+  const setProjectFilter = (next: string) => {
+    setProjectFilterState(next);
+    writeStored("cc.projectFilter", next);
+  };
 
   // The reading view owns a route, so a card is deep-linkable and browser back
   // returns to the board.
@@ -1026,6 +1076,14 @@ function CommandCenter({ subPath }: { subPath: string }) {
 
   // A card id in the route means "read this one" — the whole panel becomes the
   // document, rather than the board with something floating over it.
+  const projectOptions = Array.from(
+    new Set(board.cards.map(projectLabel).filter((name): name is string => name !== null)),
+  ).sort();
+  const visibleCards =
+    projectFilter === "all"
+      ? board.cards
+      : board.cards.filter((card) => projectLabel(card) === projectFilter);
+
   const viewing = subPath.trim();
   if (viewing !== "") {
     return (
@@ -1039,8 +1097,9 @@ function CommandCenter({ subPath }: { subPath: string }) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="space-y-3 p-4 pb-2 md:p-5 md:pb-2">
+      <div className="space-y-3 px-4 pt-2 md:px-5">
         <div className="mx-auto w-full max-w-3xl space-y-3">
+          {composerOpen ? (
           <Composer
             rpc={rpc}
             projects={projects}
@@ -1050,6 +1109,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
             voice={voice}
             onAdded={refresh}
           />
+          ) : null}
 
           {board.chiefError !== null ? (
             <p className="rounded-md border border-destructive/40 px-3 py-2 text-xs text-destructive">
@@ -1099,15 +1159,66 @@ function CommandCenter({ subPath }: { subPath: string }) {
         {/* Centred on the same axis as the composer, just given more room —
             four lanes do not fit the composer's reading width. */}
         <div className="mx-auto w-full max-w-6xl">
+        <div className="sticky top-0 z-10 -mx-1 mb-3 flex items-center gap-2 bg-background px-1 py-2">
+          <div className="flex min-w-0 flex-1 gap-1.5 overflow-x-auto">
+            {VIEW_ORDER.map((entry) => {
+              const count =
+                entry === "active"
+                  ? visibleCards.filter((card) => ACTIVE_LANES.includes(card.lane)).length
+                  : visibleCards.filter((card) => card.lane === entry).length;
+              const selected = view === entry;
+              const urgent = entry === "needs_you" && count > 0;
+              return (
+                <button
+                  key={entry}
+                  type="button"
+                  onClick={() => setView(entry)}
+                  className={`shrink-0 rounded-full border px-3 py-1 text-xs ${
+                    selected
+                      ? "border-foreground bg-foreground text-background"
+                      : urgent
+                        ? "border-destructive/60 text-destructive"
+                        : "border-border text-muted-foreground"
+                  }`}
+                >
+                  {entry === "active" ? "Active" : LANE_TITLES[entry]} {count}
+                </button>
+              );
+            })}
+          </div>
+          {projectOptions.length > 1 ? (
+            <select
+              value={projectFilter}
+              onChange={(event) => setProjectFilter(event.target.value)}
+              className="h-7 max-w-[8rem] shrink-0 rounded-md border border-border bg-background px-1.5 text-xs"
+              aria-label="Filter by project"
+            >
+              <option value="all">All projects</option>
+              {projectOptions.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          ) : null}
+          <Button
+            size="sm"
+            variant={composerOpen ? "secondary" : "outline"}
+            className="shrink-0"
+            onClick={() => setComposerOpen((open) => !open)}
+          >
+            {composerOpen ? "Close" : "+ Add"}
+          </Button>
+        </div>
         {isLoading && board.cards.length === 0 ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
         ) : (
-          <div className={isCompact ? "space-y-3" : "flex gap-3"}>
-            {LANES_ORDER.map((lane) => (
+          <div className={isCompact || view !== "active" ? "space-y-3" : "flex gap-3"}>
+            {(view === "active" ? ACTIVE_LANES : [view]).map((lane) => (
               <BoardColumn
                 key={lane}
                 lane={lane}
-                cards={board.cards.filter((card) => card.lane === lane)}
+                cards={visibleCards.filter((card) => card.lane === lane)}
                 rpc={rpc}
                 isCompact={isCompact}
                 onRead={(card) => openViewer(card.id)}
